@@ -1,0 +1,520 @@
+// ============================================================
+// SLIDES PLATFORM — PRISMA SCHEMA
+// ============================================================
+// Postgres via Prisma ORM.
+// Run: pnpm db:generate && pnpm db:migrate
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// ENUMS
+// ============================================================
+
+enum Role {
+  ADMIN
+  EDITOR
+  VIEWER
+}
+
+enum TemplateStatus {
+  DRAFT
+  ACTIVE
+  INACTIVE
+}
+
+enum FieldType {
+  TEXT
+  NUMBER
+  DATE
+  BOOLEAN
+  JUDGMENT
+  CONDITIONAL
+  NARRATIVE
+  METADATA_TAG
+}
+
+enum ConditionType {
+  SLIDE_VISIBILITY
+  OBJECT_VISIBILITY
+}
+
+enum ConditionTarget {
+  SLIDE
+  OBJECT
+}
+
+enum ConditionOperator {
+  EQUALS
+  NOT_EQUALS
+  GREATER_THAN
+  LESS_THAN
+  GREATER_THAN_OR_EQUAL
+  LESS_THAN_OR_EQUAL
+  CONTAINS
+  NOT_CONTAINS
+  IS_TRUE
+  IS_FALSE
+  IS_NULL
+  IS_NOT_NULL
+}
+
+enum ConditionAction {
+  SHOW
+  HIDE
+}
+
+enum RunStatus {
+  PENDING
+  FETCHING
+  PREVIEW
+  GENERATING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum DataProviderType {
+  DATABRICKS
+  REST_API
+  MOCK
+}
+
+enum LlmProviderType {
+  OPENAI
+  ANTHROPIC
+  STUB
+}
+
+// ============================================================
+// USER SESSION
+// Lightweight manual auth — designed so Google Workspace OIDC
+// can be dropped in later by replacing session creation.
+// ============================================================
+
+model UserSession {
+  id           String   @id @default(uuid())
+  name         String
+  email        String?  // reserved for future SSO/Google auth
+  role         Role     @default(EDITOR)
+  sessionToken String   @unique
+  expiresAt    DateTime
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  generationRuns GenerationRun[]
+  auditEntries   AuditEntry[]
+
+  @@map("user_sessions")
+}
+
+// ============================================================
+// TEMPLATE
+// Represents a connected Google Slides presentation template.
+// ============================================================
+
+model Template {
+  id             String         @id @default(uuid())
+  name           String
+  description    String?
+  googleSlideId        String         // source Google Slides presentation ID (never modified)
+  workingGoogleSlideId String?        // copy with [Field] → {{FIELD}} tokens applied
+  googleSlideUrl        String
+  status                TemplateStatus @default(DRAFT)
+  thumbnailUrl   String?        // cached slide thumbnail
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+  lastScannedAt      DateTime?
+  archivedAt         DateTime?
+  lastScannedTokens  String[]        // raw tokens found in most recent scan
+  dismissedTokens    String[]        // tokens user dismissed from mapping suggestions
+  slideStructure     Json?           // cached slide element layout from last scan
+
+  fields         TemplateField[]
+  objectTags     TemplateObjectTag[]
+  conditions     TemplateCondition[]
+  versions       TemplateVersion[]
+  generationRuns GenerationRun[]
+  scanResults    ScanResult[]
+  syncLogs       TemplateSyncLog[]
+  slideTags      TemplateSlideTag[]
+
+  @@map("templates")
+}
+
+// ============================================================
+// TEMPLATE VERSION
+// Point-in-time snapshot of a template's field configuration.
+// Enables change tracking across template edits.
+// ============================================================
+
+model TemplateVersion {
+  id         String   @id @default(uuid())
+  templateId String
+  version    Int
+  snapshot   Json     // full field + condition config at time of version
+  notes      String?
+  createdAt  DateTime @default(now())
+
+  template Template @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  @@unique([templateId, version])
+  @@map("template_versions")
+}
+
+// ============================================================
+// TEMPLATE FIELD
+// A placeholder or field defined in a template.
+// Supports: text tokens, boolean symbols, judgment fields, etc.
+//
+// Future loop/repeat support: add a `repeating Boolean` flag
+// and `groupKey String?` to support repeating slide sections.
+// The field model is intentionally extensible for this use case.
+// ============================================================
+
+model TemplateField {
+  id             String     @id @default(uuid())
+  templateId     String
+  name           String     // e.g. "company", "metrics.users_enabled"
+  token          String     // e.g. "{{company}}"
+  fieldType      FieldType  @default(TEXT)
+  detectedType   FieldType? // auto-detected suggestion before user override
+  isAutoDetected Boolean    @default(false)
+  isManual       Boolean    @default(false)
+  dataPath       String?    // dot-path into provider response data
+  description    String?
+  required       Boolean    @default(false)
+  defaultValue   String?
+  sortOrder      Int        @default(0)
+
+  // Boolean rendering config: { renderTrue: "●", renderFalse: "○", color: "#599d15" }
+  booleanConfig Json?
+
+  // Judgment config: { suggestedType: "health"|"risk"|etc., criteria: [], threshold: null }
+  judgmentConfig Json?
+
+  // Narrative config: { prompt: string, maxLength: number }
+  narrativeConfig Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  template    Template               @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  fieldValues GenerationFieldValue[]
+
+  @@unique([templateId, name])
+  @@map("template_fields")
+}
+
+// ============================================================
+// TEMPLATE OBJECT TAG
+// Maps a Google Slides object (by objectId) to tag metadata.
+// Enables conditional visibility and future looping support
+// for non-text-token based objects.
+// ============================================================
+
+model TemplateObjectTag {
+  id          String   @id @default(uuid())
+  templateId  String
+  objectId    String   // Google Slides shape/element objectId
+  slideIndex  Int?
+  tagKey      String   // e.g. "condition", "repeat", "judgment"
+  tagValue    String?  // e.g. "feature.announcements", "true"
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  template Template @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  @@map("template_object_tags")
+}
+
+// ============================================================
+// TEMPLATE CONDITION
+// Defines conditional show/hide logic for slides or objects.
+// Applied during deck generation by the rendering engine.
+// ============================================================
+
+model TemplateCondition {
+  id            String            @id @default(uuid())
+  templateId    String
+  name          String
+  conditionType ConditionType
+  targetType    ConditionTarget
+  targetId      String            // slide index (as string) or Google objectId
+  fieldName     String            // which template field to evaluate
+  operator      ConditionOperator
+  value         String            // comparison value (stored as string)
+  action        ConditionAction   @default(HIDE)
+  isActive      Boolean           @default(true)
+  sortOrder     Int               @default(0)
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+
+  template Template @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  @@map("template_conditions")
+}
+
+// ============================================================
+// GENERATION RUN
+// A single deck generation event. Tracks full lifecycle:
+// template → fetch → preview → edit → generate → output.
+// ============================================================
+
+model GenerationRun {
+  id        String    @id @default(uuid())
+  templateId String?  // nullable so run history survives template deletion
+  sessionId  String?
+
+  // Actor identity (manual name in v1; future: linked to UserSession.email)
+  actorName String
+
+  // Input parameters
+  companyId    String
+  providerName String?
+
+  // Run state
+  status RunStatus @default(PENDING)
+
+  // Data summaries (non-sensitive snapshots for audit/display)
+  sourceDataSummary   Json? // { fieldCount: N, fetchedAt: ISO }
+  editedFieldsSummary Json? // { editedCount: N, fields: [...] }
+
+  // Output
+  generatedPresentationId  String?
+  generatedPresentationUrl String?
+
+  // Error tracking
+  errorMessage String?
+  errorDetails Json?
+
+  // Package type selection
+  packageTypeId       String?  // resolved package type for this run
+  packageTypeOverride Boolean  @default(false) // true if manually selected
+
+  // Correlation for log tracing
+  correlationId String?
+
+  startedAt   DateTime?
+  completedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  template     Template?              @relation(fields: [templateId], references: [id])
+  session      UserSession?           @relation(fields: [sessionId], references: [id])
+  packageType  PackageType?           @relation(fields: [packageTypeId], references: [id])
+  fieldValues  GenerationFieldValue[]
+  auditEntries AuditEntry[]
+
+  @@map("generation_runs")
+}
+
+// ============================================================
+// GENERATION FIELD VALUE
+// Per-field values recorded during a generation run.
+// Preserves source → edited → final pipeline for full audit.
+// ============================================================
+
+model GenerationFieldValue {
+  id        String  @id @default(uuid())
+  runId     String
+  fieldId   String?
+  fieldName String
+
+  sourceValue String? // raw value from provider
+  editedValue String? // user-entered override (if any)
+  finalValue  String? // value actually applied to the deck
+
+  wasEdited  Boolean   @default(false)
+  editReason String?   // required when wasEdited = true
+  editorName String?
+  editedAt   DateTime?
+
+  createdAt DateTime @default(now())
+
+  run   GenerationRun  @relation(fields: [runId], references: [id], onDelete: Cascade)
+  field TemplateField? @relation(fields: [fieldId], references: [id])
+
+  @@map("generation_field_values")
+}
+
+// ============================================================
+// AUDIT ENTRY
+// Structured audit log. Written for:
+//   - generation runs
+//   - template mutations
+//   - field edits
+//   - provider config changes
+// Also written to the hidden audit slide in generated decks.
+// ============================================================
+
+model AuditEntry {
+  id        String  @id @default(uuid())
+  runId     String?
+  sessionId String?
+
+  actorName  String
+  action     String  // e.g. "FIELD_EDITED", "DECK_GENERATED", "TEMPLATE_SCANNED"
+  entityType String  // e.g. "GenerationRun", "TemplateField", "Template"
+  entityId   String?
+
+  before Json? // state before change
+  after  Json? // state after change
+  reason String? // change reason (required for field edits)
+
+  // Request tracing
+  correlationId String?
+  ipAddress     String? // hashed/masked — not stored raw
+
+  createdAt DateTime @default(now())
+
+  run     GenerationRun? @relation(fields: [runId], references: [id])
+  session UserSession?   @relation(fields: [sessionId], references: [id])
+
+  @@map("audit_entries")
+}
+
+// ============================================================
+// PROVIDER CONFIG
+// Data source provider configuration (Databricks, REST, etc.)
+// Sensitive fields (tokens, passwords) must be encrypted at rest
+// using application-level encryption before storage.
+// ============================================================
+
+model ProviderConfig {
+  id           String           @id @default(uuid())
+  name         String           @unique
+  displayName  String
+  providerType DataProviderType
+  isActive     Boolean          @default(false)
+  isDefault    Boolean          @default(false)
+
+  // Config stored as JSON. Sensitive fields encrypted at app layer.
+  // Schema varies by providerType — see providers/ for structure.
+  config Json
+
+  lastTestedAt    DateTime?
+  lastTestSuccess Boolean?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@map("provider_configs")
+}
+
+// ============================================================
+// LLM PROVIDER CONFIG
+// LLM provider configuration (OpenAI, Anthropic, stub).
+// API keys encrypted at app layer before storage.
+// ============================================================
+
+model LlmProviderConfig {
+  id           String          @id @default(uuid())
+  name         String          @unique
+  displayName  String
+  providerType LlmProviderType
+  isActive     Boolean         @default(false)
+  isDefault    Boolean         @default(false)
+
+  // Config stored as JSON. API keys encrypted at app layer.
+  config Json
+
+  lastTestedAt    DateTime?
+  lastTestSuccess Boolean?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@map("llm_provider_configs")
+}
+
+// ============================================================
+// PACKAGE TYPE
+// Admin-managed list of package tiers (e.g. Core, Pro, Elite).
+// Names are user-defined so they can be renamed without code change.
+// ============================================================
+
+model PackageType {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  isActive  Boolean  @default(true)
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  slideTags      TemplateSlideTag[]
+  generationRuns GenerationRun[]
+
+  @@map("package_types")
+}
+
+// ============================================================
+// TEMPLATE SLIDE TAG
+// Maps a slide index within a template to a package type.
+// Auto-detected by the scanner; admin can correct after import.
+// @@unique on [templateId, slideIndex] ensures one tag per slide.
+// ============================================================
+
+model TemplateSlideTag {
+  id             String   @id @default(uuid())
+  templateId     String
+  slideIndex     Int      // 0-based slide index in the presentation
+  slideObjectId  String?  // Google Slides page objectId for reference
+  packageTypeId  String
+  isAutoDetected Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  template    Template    @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  packageType PackageType @relation(fields: [packageTypeId], references: [id])
+
+  @@unique([templateId, slideIndex])
+  @@map("template_slide_tags")
+}
+
+// ============================================================
+// SCAN RESULT
+// Records each template scan event and detected fields.
+// Provides scan history and diffing capability over time.
+// ============================================================
+
+model ScanResult {
+  id             String   @id @default(uuid())
+  templateId     String
+  detectedFields Json     // array of { name, token, suggestedType, source }
+  rawScanData    Json?    // raw Google Slides API response (sanitized)
+  scanDurationMs Int?
+  fieldCount     Int      @default(0)
+  triggeredBy    String?  // actor name
+  createdAt      DateTime @default(now())
+
+  template Template @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  @@map("scan_results")
+}
+
+// ============================================================
+// TEMPLATE SYNC LOG
+// Audit trail for template lifecycle operations.
+// ============================================================
+
+model TemplateSyncLog {
+  id         String   @id @default(uuid())
+  templateId String
+  action     String   // IMPORT | SCAN | SYNC | ARCHIVE | RESTORE | FIELD_ADDED | FIELD_UPDATED
+  actorName  String?
+  details    Json?
+  success    Boolean  @default(true)
+  error      String?
+  createdAt  DateTime @default(now())
+
+  template Template @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  @@map("template_sync_logs")
+}
